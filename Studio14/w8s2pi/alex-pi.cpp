@@ -1,145 +1,280 @@
-#include <string.h>
-#include <stdint.h>
 #include <stdio.h>
-
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <stdint.h>
+#include "packet.h"
+#include "serial.h"
 #include "serialize.h"
+#include "constants.h"
 
-#define MAGIC_NUMBER				0xFCFDFEFF
+#define PORT_NAME			"/dev/ttyACM0"
+#define BAUD_RATE			B9600
 
-/* Data size is 4 + 128 + 4 + 1 = 137 bytes. We pad to 140 bytes as this is the nearest divisible by 4 we have. So 
-	 we add 3 bytes */
+int exitFlag=0;
+sem_t _xmitSema;
 
-typedef struct comms
+void handleError(TResult error)
 {
-	uint32_t magic;
-	uint32_t dataSize;
-	char buffer[MAX_DATA_SIZE];
-	unsigned char checksum;
-	char dummy[3];
-} TComms;
-
-static char _privateBuffer[PACKET_SIZE];
-
-static TResult assemble(char *outputBuffer, const char *inputBuffer, int len)
-{
-	// For copying to output buffer
-	static int counter=0;
-
-	// If there's leftover bytes from the next transmission
-	static int leftoverFlag=0;
-	static int leftoverCount=0;
-	static char leftoverBuffer[PACKET_SIZE];
-
-	int bytesLeft;
-	int i;	
-
-	// Copy in leftovers
-	if(leftoverFlag)
+	switch(error)
 	{
-		int copyCount;
-		if(leftoverCount <= PACKET_SIZE)
-		{
-			leftoverFlag=0;
-			copyCount = leftoverCount;
-		}
-		else
-			copyCount = PACKET_SIZE;
+		case PACKET_BAD:
+			printf("ERROR: Bad Magic Number\n");
+			break;
 
-		leftoverCount -= copyCount;
+		case PACKET_CHECKSUM_BAD:
+			printf("ERROR: Bad checksum\n");
+			break;
 
-		for(i=0; i<copyCount; i++)
-		{
-			outputBuffer[counter++] = leftoverBuffer[i];
-		}
+		default:
+			printf("ERROR: UNKNOWN ERROR\n");
 	}
-
-	if(counter + len >= PACKET_SIZE)
-	{
-		bytesLeft = (PACKET_SIZE - counter);
-		leftoverFlag=1;
-		int bytesToCopy = len - bytesLeft;
-
-		// Copy to leftover buffer
-		for(i=0; i<bytesToCopy; i++)
-		{
-			leftoverBuffer[leftoverCount+i] = inputBuffer[bytesLeft + i];
-		}
-		leftoverCount += bytesToCopy;
-	}
-	else
-		bytesLeft = len;
-
-	for(i=0; i<bytesLeft; i++)
-		outputBuffer[counter++] = inputBuffer[i];
-
-	if(counter == PACKET_SIZE)
-	{
-		counter = 0;
-		return PACKET_COMPLETE;
-	}
-	else
-		return PACKET_INCOMPLETE;
 }
 
-
-TResult deserialize(const char *buffer, int len, void *output)
+void handleStatus(TPacket *packet)
 {
-	TResult result = assemble(_privateBuffer, buffer, len);
+	printf("\n ------- ALEX STATUS REPORT ------- \n\n");
+	printf("Left Forward Ticks:\t\t%d\n", packet->params[0]);
+	printf("Right Forward Ticks:\t\t%d\n", packet->params[1]);
+	printf("Left Reverse Ticks:\t\t%d\n", packet->params[2]);
+	printf("Right Reverse Ticks:\t\t%d\n", packet->params[3]);
+	printf("Left Forward Ticks Turns:\t%d\n", packet->params[4]);
+	printf("Right Forward Ticks Turns:\t%d\n", packet->params[5]);
+	printf("Left Reverse Ticks Turns:\t%d\n", packet->params[6]);
+	printf("Right Reverse Ticks Turns:\t%d\n", packet->params[7]);
+	printf("Forward Distance:\t\t%d\n", packet->params[8]);
+	printf("Reverse Distance:\t\t%d\n", packet->params[9]);
+	printf("Target Ticks:\t\t%d\n", packet->params[10]);
+	printf("Delta Ticks:\t\t%d\n", packet->params[11]);
 
-	if(result == PACKET_COMPLETE)
-	{
-		// Extract out the comms packet
-		TComms *comms = (TComms *) _privateBuffer;
 
-		// Check that we have a valid packet
-		if(comms->magic != MAGIC_NUMBER)
-		{
-			printf("BAD MAGIC NUMBER. EXPECTED %x GOT %x\n", MAGIC_NUMBER, comms->magic);
-			return PACKET_BAD;
-		}
-
-		// Packet is valid. Now let's do the checksum
-		unsigned char checksum = 0;
-
-		unsigned int i;
-
-		for(i=0; i<comms->dataSize; i++)
-			checksum ^= comms->buffer[i];
-
-		if(checksum != comms->checksum)
-			return PACKET_CHECKSUM_BAD;
-		else
-		{
-			memcpy(output, comms->buffer, comms->dataSize);
-			return PACKET_OK;
-		}
-	}
-	else
-		return result;
+	printf("\n---------------------------------------\n\n");
 }
 
-int serialize(char *buffer, void *dataStructure, size_t size)
+void handleResponse(TPacket *packet)
 {
-	TComms comms;
+	// The response code is stored in command
+	switch(packet->command)
+	{
+		case RESP_OK:
+			printf("Command OK\n");
+		break;
 
-	// We use this to detect for malformed packets
-	comms.magic = MAGIC_NUMBER;
+		case RESP_STATUS:
+			handleStatus(packet);
+		break;
 
-	// Copy over the data structure
-	memcpy(comms.buffer, dataStructure, size);
+		default:
+			printf("Arduino is confused\n");
+	}
+}
 
-	// Now we take a checksum
-	unsigned char checksum = 0;
+void handleErrorResponse(TPacket *packet)
+{
+	// The error code is returned in command
+	switch(packet->command)
+	{
+		case RESP_BAD_PACKET:
+			printf("Arduino received bad magic number\n");
+		break;
 
-	unsigned i;
+		case RESP_BAD_CHECKSUM:
+			printf("Arduino received bad checksum\n");
+		break;
 
-	for(i=0; i<size; i++)
-		checksum ^= comms.buffer[i];
+		case RESP_BAD_COMMAND:
+			printf("Arduino received bad command\n");
+		break;
 
-	comms.checksum = checksum;
-	comms.dataSize = size;
+		case RESP_BAD_RESPONSE:
+			printf("Arduino received unexpected response\n");
+		break;
 
-	memcpy(buffer, &comms, sizeof(TComms));
+		default:
+			printf("Arduino reports a weird error\n");
+	}
+}
 
-	return sizeof(TComms);
+void handleMessage(TPacket *packet)
+{
+	printf("Message from Alex: %s\n", packet->data);
+}
+
+void handlePacket(TPacket *packet)
+{
+	switch(packet->packetType)
+	{
+		case PACKET_TYPE_COMMAND:
+				// Only we send command packets, so ignore
+			break;
+
+		case PACKET_TYPE_RESPONSE:
+				handleResponse(packet);
+			break;
+
+		case PACKET_TYPE_ERROR:
+				handleErrorResponse(packet);
+			break;
+
+		case PACKET_TYPE_MESSAGE:
+				handleMessage(packet);
+			break;
+	}
+}
+
+void sendPacket(TPacket *packet)
+{
+	char buffer[PACKET_SIZE];
+	int len = serialize(buffer, packet, sizeof(TPacket));
+
+	serialWrite(buffer, len);
+}
+
+void *receiveThread(void *p)
+{
+	char buffer[PACKET_SIZE];
+	int len;
+	TPacket packet;
+	TResult result;
+	int counter=0;
+
+	while(1)
+	{
+		len = serialRead(buffer);
+		counter+=len;
+		if(len > 0)
+		{
+			result = deserialize(buffer, len, &packet);
+
+			if(result == PACKET_OK)
+			{
+				counter=0;
+				handlePacket(&packet);
+			}
+			else 
+				if(result != PACKET_INCOMPLETE)
+				{
+					printf("PACKET ERROR\n");
+					handleError(result);
+				}
+		}
+	}
+}
+
+void flushInput()
+{
+	char c;
+
+	while((c = getchar()) != '\n' && c != EOF);
+}
+
+void getParams(TPacket *commandPacket)
+{
+	printf("Enter distance/angle in cm/degrees (e.g. 50) and power in %% (e.g. 75) separated by space.\n");
+	printf("E.g. 50 75 means go at 50 cm at 75%% power for forward/backward, or 50 degrees left or right turn at 75%%  power\n");
+	scanf("%d %d", &commandPacket->params[0], &commandPacket->params[1]);
+	flushInput();
+}
+
+void sendCommand(char command)
+{
+	TPacket commandPacket;
+
+	commandPacket.packetType = PACKET_TYPE_COMMAND;
+
+	switch(command)
+	{
+		case 'f':
+		case 'F':
+			getParams(&commandPacket);
+			commandPacket.command = COMMAND_FORWARD;
+			sendPacket(&commandPacket);
+			break;
+
+		case 'b':
+		case 'B':
+			getParams(&commandPacket);
+			commandPacket.command = COMMAND_REVERSE;
+			sendPacket(&commandPacket);
+			break;
+
+		case 'l':
+		case 'L':
+			getParams(&commandPacket);
+			commandPacket.command = COMMAND_TURN_LEFT;
+			sendPacket(&commandPacket);
+			break;
+
+		case 'r':
+		case 'R':
+			getParams(&commandPacket);
+			commandPacket.command = COMMAND_TURN_RIGHT;
+			sendPacket(&commandPacket);
+			break;
+
+		case 's':
+		case 'S':
+			commandPacket.command = COMMAND_STOP;
+			sendPacket(&commandPacket);
+			break;
+
+		case 'c':
+		case 'C':
+			commandPacket.command = COMMAND_CLEAR_STATS;
+			commandPacket.params[0] = 0;
+			sendPacket(&commandPacket);
+			break;
+
+		case 'g':
+		case 'G':
+			commandPacket.command = COMMAND_GET_STATS;
+			sendPacket(&commandPacket);
+			break;
+
+		case 'q':
+		case 'Q':
+			exitFlag=1;
+			break;
+
+		default:
+			printf("Bad command\n");
+
+	}
+}
+
+int main()
+{
+	// Connect to the Arduino
+	startSerial(PORT_NAME, BAUD_RATE, 8, 'N', 1, 5);
+
+	// Sleep for two seconds
+	printf("WAITING TWO SECONDS FOR ARDUINO TO REBOOT\n");
+	sleep(2);
+	printf("DONE\n");
+
+	// Spawn receiver thread
+	pthread_t recv;
+
+	pthread_create(&recv, NULL, receiveThread, NULL);
+
+	// Send a hello packet
+	TPacket helloPacket;
+
+	helloPacket.packetType = PACKET_TYPE_HELLO;
+	sendPacket(&helloPacket);
+
+	while(!exitFlag)
+	{
+		char ch;
+		printf("Command (f=forward, b=reverse, l=turn left, r=turn right, s=stop, c=clear stats, g=get stats q=exit)\n");
+		scanf("%c", &ch);
+
+		// Purge extraneous characters from input stream
+		flushInput();
+
+		sendCommand(ch);
+	}
+
+	printf("Closing connection to Arduino.\n");
+	endSerial();
 }
