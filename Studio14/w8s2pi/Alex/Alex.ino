@@ -67,8 +67,9 @@ void left(float ang, float speed)
 {
   if (ang == 0)
     deltaTicks = 99999999;
-  else
+  else {
     deltaTicks = computeDeltaTicks(ang);
+  }
   targetTicks = leftReverseTicksTurns + deltaTicks;
   ccw(ang, speed);
 }
@@ -130,6 +131,9 @@ void sendStatus()
   statusPacket.params[7] = rightReverseTicksTurns;
   statusPacket.params[8] = forwardDist;
   statusPacket.params[9] = reverseDist;
+  statusPacket.params[10] = targetTicks;
+  statusPacket.params[11] = deltaTicks;
+
 
   sendResponse(&statusPacket);
 }
@@ -577,6 +581,4 @@ void loop()
       stop();
     }
   }
-
-
 }
