@@ -1,4 +1,5 @@
 #include <AFMotor.h>
+
 // Direction values
 
 
@@ -58,12 +59,22 @@ void move(float speed, int direction)
 
 void forward(float dist, float speed)
 {
+	if(dist > 0)
+	deltaDist = dist;
+	else
+	deltaDist=9999999;
+
+newDist=forwardDist + deltaDist;
   dir = (TDirection) FORWARD;
   move(speed, GO);
 }
 
 void backward(float dist, float speed)
 {
+  if(dist > 0)
+	deltaDist = dist;
+	else
+	deltaDist=9999999;
   dir = (TDirection) BACKWARD;
   move(speed, BACK);
 }
